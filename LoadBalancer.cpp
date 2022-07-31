@@ -7,33 +7,21 @@ LoadBalancer::LoadBalancer() {
     // responseData = (char*) malloc(responseDataSize * sizeof(char));
 
     for (int i = 0; i < MAX_CONNECTIONS; i++) {
-        connections[i] = (struct context*)malloc(sizeof(struct context));
+        connections[i] = (struct context*) malloc(sizeof(struct context));
     } 
 }
 
 void LoadBalancer::setNonBlocking(int socket) {
     int flags = fcntl(socket, F_GETFD, 0); // get current flags
-    if (fcntl(socket, F_SETFD, flags | O_NONBLOCK)) {
-        handle_error("fcntl");
-    }
+    if (fcntl(socket, F_SETFD, flags | O_NONBLOCK)) handle_error("fcntl");
 }
 
 void LoadBalancer::setReuseAddr(int socket) {
-    if (setsockopt(socket, SOL_SOCKET, SO_REUSEADDR, &REUSEADDR, sizeof(REUSEADDR)) < 0) {
-        perror("Erro while setting master socket options");
-		exit(EXIT_FAILURE);
-    }
+    if (setsockopt(socket, SOL_SOCKET, SO_REUSEADDR, &REUSEADDR, sizeof(REUSEADDR)) < 0)
+        handle_error("Erro while setting master socket options");
 }
 
 void LoadBalancer::init() {
-    // sigemptyset(&sigset);
-    // sigaddset(&sigset, SIGTERM);
-    // sigprocmask(SIG_SETMASK, &sigset, NULL);
-
-    // int signal_fd = signalfd(-1, &sigset, 0);
-    // pollfds[SIGNAL_FD].fd = signal_fd;
-    // pollfds[SIGNAL_FD].events = POLLIN;
-
     startListen();
     pollfds[SERVER_FD].fd = masterSocket;
     pollfds[SERVER_FD].events = POLLIN;
@@ -48,11 +36,7 @@ void LoadBalancer::init() {
 }
 
 void LoadBalancer::startListen() {
-    if ((masterSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)) < 0)
-    {
-        perror("In socket");
-        exit(EXIT_FAILURE);
-    }
+    if ((masterSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)) < 0) handle_error("In socket");
 
     setNonBlocking(masterSocket);
     setReuseAddr(masterSocket);
@@ -61,23 +45,14 @@ void LoadBalancer::startListen() {
     address.sin_addr.s_addr = INADDR_ANY;
     address.sin_port = htons(port);
     
-    if (bind(masterSocket, (struct sockaddr *)&address, sizeof(address)) < 0)
-    {
-        perror("In bind");
-        exit(EXIT_FAILURE);
-    }
-
-    if (listen(masterSocket, backlog) < 0)
-    {
-        perror("In listen");
-        exit(EXIT_FAILURE);
-    }
+    if (bind(masterSocket, (struct sockaddr *)&address, sizeof(address)) < 0) handle_error("In bind");
+    if (listen(masterSocket, backlog) < 0) handle_error("In listen");
 }
 
 void LoadBalancer::run() {
     init();
 
-    // connectServers();
+    connectServers();
 
     printf("\n------------ load balancer running on port %d ------------\n", port);
 
@@ -90,11 +65,41 @@ void LoadBalancer::run() {
 
         acceptConnection();
         handleConnections();
-        // int new_connection = acceptConnection();
-        // passRequest(new_connection);
-        // close(new_connection);
+    }
+}
+
+void LoadBalancer::acceptConnection() {
+    if (pollfds[SERVER_FD].revents & POLLERR)
+        handle_error("server failure");
+    
+    if (pollfds[SERVER_FD].revents & POLLIN) { // check if have activity on the laodbalancer listener
+        struct sockaddr_in clientAddress;
+        int clientAddrlen = sizeof(clientAddress);
+        int socket = accept(masterSocket, (struct sockaddr *)&clientAddress, (socklen_t *)&clientAddrlen);
+        // printf("\nNew connection , socket fd is %d , ip is : %s , port : %d \n", socket, inet_ntoa(clientAddress.sin_addr), ntohs(clientAddress.sin_port));
+        if (socket < 0) handle_error("Error acception connection");
+
+        createConnection(socket);
+    }
+}
+
+struct context* LoadBalancer::createConnection(int socket) {
+    struct context* connection;
+    setNonBlocking(socket);
+    for (int i = 0; i < MAX_CONNECTIONS; i++) {
+        if (!connections[i]->valid) {
+            short events_out = 0;
+            connection = createContext(i, socket, &events_out);
+            if (!connection->valid) handle_error("create_connection");
+
+            pollfds[FIRST_CONNECTION + i].fd = socket;
+            pollfds[FIRST_CONNECTION + i].events = events_out;
+            total_connections++;
+            break;
+        }
     }
 
+    return connection;
 }
 
 void LoadBalancer::handleConnections() {
@@ -106,9 +111,9 @@ void LoadBalancer::handleConnections() {
             struct context* connection = connections[i];
             short events_out = 0;
             int connection_completed = 0;
-            if (handleConn(connection, revents, &events_out, &connection_completed)) {
+            if (handleConn(connection, revents, &events_out, &connection_completed))
                 handle_error("handle_connection");
-            }
+
             pollfds[i + FIRST_CONNECTION].events = events_out;
             /* If a connection was completed, free the context object. If
                 * the number of connections was capped, the server is now free
@@ -130,8 +135,6 @@ void LoadBalancer::handleConnections() {
  * TO DO change variable received by address
 */
 int LoadBalancer::handleConn(struct context* ctx, short revents, short* events_out, int* connection_completed) {
-    ssize_t result, max_bytes;
-
     /* POLLHUP means that the other end has closed the connection (hung up!). No
        need to continue. */
     if (revents & POLLHUP) {
@@ -141,40 +144,10 @@ int LoadBalancer::handleConn(struct context* ctx, short revents, short* events_o
 
     switch (ctx->state) {
     case ReceivingRequest:
-        max_bytes = sizeof(ctx->buf) - ctx->bytes - 1;
-        result = read(ctx->fd, ctx->buf + ctx->bytes, max_bytes);
-        if (result < 0) {
-            return -1;
-        }
-        ctx->bytes += result;
-        ctx->buf_end = (char*) memchr(ctx->buf, '\n', ctx->bytes);
-        if (ctx->buf_end) {
-            ctx->state = SendingRequest;
-            ctx->bytes = 0;
-            *events_out = POLLOUT;
-        } else {
-            *events_out = POLLIN;
-            *connection_completed = 0;
-            break;
-        }
+        recvHttpRequest(ctx, events_out, connection_completed);
         // fallthrough
     case SendingRequest:
-        max_bytes = strlen(ctx->buf) - ctx->bytes;
-        /* Similarly as with reading, writing may not write all the bytes at
-         * once, and we may need to wait for the socket to become readable
-         * again. */
-        result = write(ctx->fd, ctx->buf + ctx->bytes, max_bytes);
-        if (result < 0) {
-            return -1;
-        }
-        ctx->bytes += result;
-        if (result == max_bytes) {
-            ctx->state = Done;
-        } else {
-            *events_out = POLLOUT;
-            *connection_completed = 0;
-            break;
-        }
+        sendHttpRequest(ctx, events_out, connection_completed);
         // fallthrough
         case Done:
             *events_out = 0;
@@ -188,13 +161,13 @@ void LoadBalancer::destroyConnection(struct context* ctx)
 {
     ctx->valid = false;
     close(ctx->fd);
+    total_connections--;
     // free(ctx);
 }
 
 void LoadBalancer::disconnectClient(int socket) {
     // printf("Disconnection , socket fd is %d , ip is : %s , port : %d \n", socket, inet_ntoa(address.sin_addr), ntohs(address.sin_port));
     close(socket);
-    total_connections--;
 }
 
 void LoadBalancer::connectServers() {
@@ -202,26 +175,21 @@ void LoadBalancer::connectServers() {
         const char* serverIpAddress = servers[i].first.c_str();
         int serverPortNumber = servers[i].second;
 
-        SocketAddress serverAddr;
+        struct sockaddr_in serverAddr;
         serverAddr.sin_family = AF_INET;
         serverAddr.sin_port = htons(serverPortNumber);
 
         // Convert IPv4 and IPv6 addresses from text to binary form
         if (inet_pton(AF_INET, serverIpAddress, &serverAddr.sin_addr) <= 0) {
             printf("\nInvalid address/ Address not supported \n");
-            
             return;
         }
 
         serversAddresses.push_back(serverAddr);
-        createServerConnection(serverAddr);
     }
-
-    printf("Number of connected servers: %d\n\n", (int) serversSockets.size());
-
 }
 
-void LoadBalancer::createServerConnection(SocketAddress serverAddr) {
+struct context* LoadBalancer::createServerConnection(struct sockaddr_in serverAddr) {
     int serverSocket;
     if ((serverSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)) < 0) {
         perror("In socket");
@@ -230,49 +198,15 @@ void LoadBalancer::createServerConnection(SocketAddress serverAddr) {
     
     setRecvTimeout(serverSocket);
 
-    if ((connect(serverSocket, (struct sockaddr*)&serverAddr, sizeof(serverAddr))) < 0) {
-        printf("\nConnection Failed \n");
-        return;
-    }
+    if ((connect(serverSocket, (struct sockaddr*)&serverAddr, sizeof(serverAddr))) < 0)
+        handle_error("Connection Failed");
 
-    serversSockets.push_back(serverSocket);
+    // TO DO see how to configure a connect to be async
+
+    return createConnection(serverSocket);
 }
 
-int LoadBalancer::acceptConnection() {
-     if (pollfds[SERVER_FD].revents & POLLERR) {
-        handle_error("server failure");
-    } else if (pollfds[SERVER_FD].revents & POLLIN) {
-        struct sockaddr_in clientAddress;
-        int clientAddrlen = sizeof(clientAddress);
-        int socket = accept(masterSocket, (struct sockaddr *)&clientAddress, (socklen_t *)&clientAddrlen);
-        // printf("\nNew connection , socket fd is %d , ip is : %s , port : %d \n", socket, inet_ntoa(clientAddress.sin_addr), ntohs(clientAddress.sin_port));
-        if (socket < 0) {
-            perror("Error acception connection");
-        }
-
-        setNonBlocking(socket);
-
-        for (int i = 0; i < MAX_CONNECTIONS; i++) { 
-            if (!connections[i]->valid) {
-                short events_out = 0;
-                struct context* connection = createConnection(i, socket, &events_out);
-                if (!connection->valid) {
-                    handle_error("create_connection");
-                }
-
-                pollfds[FIRST_CONNECTION + i].fd = socket;
-                pollfds[FIRST_CONNECTION + i].events = events_out;
-                total_connections++;
-                break;
-            }
-        }
-
-        return socket;
-    }
-    return 0; // TO DO fix this
-}
-
-struct context* LoadBalancer::createConnection(int index, int socket, short* events_out) {
+struct context* LoadBalancer::createContext(int index, int socket, short* events_out) {
     connections[index]->fd = socket;
     connections[index]->state = ReceivingRequest;
     memset(connections[index]->buf, 0, sizeof(connections[index]->buf));
@@ -292,58 +226,53 @@ void LoadBalancer::setRecvTimeout(int socket) {
     setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof tv);
 }
 
-int LoadBalancer::getServerSocket() {
+int LoadBalancer::getServerIndex() {
     // round robin
     int serverIdx = nextServer;
-    nextServer = (nextServer + 1) % (int) serversSockets.size();
+    nextServer = (nextServer + 1) % (int) serversAddresses.size();
     
-    return serversSockets[serverIdx];
+    return serverIdx;
 }
 
-void LoadBalancer::passRequest(int clientSocket) {
-    // printf("Processing Http Request To Socket: %d\n", socket);
+int LoadBalancer::recvHttpRequest(struct context* ctx, short* events_out, int* connection_completed) {
+    int max_bytes = sizeof(ctx->buf) - ctx->bytes - 1;
+    int httpRequestSize = recv(ctx->fd, ctx->buf + ctx->bytes, max_bytes, 0);
+    
+    if (httpRequestSize < 0) return -1;
 
-    int serverSocket = getServerSocket();
-
-    setRecvTimeout(clientSocket);
-    int sizeToBeSent = recvHttpRequest(clientSocket);
-    sendHttpRequest(serverSocket, sizeToBeSent);
-    sizeToBeSent = recvHttpResponse(serverSocket);
-    sendHttpResponse(clientSocket, sizeToBeSent);
-
-    // try {
-    // }
-    // catch(const std::runtime_error& re) {
-    //     handleError(socket);
-    //     cerr << "Runtime error: " << re.what() << std::endl;
-    // }
-    // catch(const std::exception& ex) {
-    //     handleError(socket);
-    //     cerr << "Error occurred: " << ex.what() << std::endl;
-    // }
-    // catch(...)
-    // {
-    //     handleError(socket);
-    // }
-
-
-    // printf("Request was completed\n");
-}
-
-int LoadBalancer::recvHttpRequest(int clientSocket) {
-    int httpRequestSize = recv(clientSocket , requestData, requestDataSize, 0); // timeout of 1 second
-    if (httpRequestSize > 0) {
-        // printf("%s\n", requestData);
-        string doNothing = "";
-    } else if (httpRequestSize <= 0) {
-        disconnectClient(clientSocket);
+    ctx->bytes += httpRequestSize;
+    ctx->buf_end = (char*) memchr(ctx->buf, '\n', ctx->bytes);
+    if (ctx->buf_end) {
+        ctx->state = SendingRequest; // change state
+        ctx->serverIndex = getServerIndex();
+        ctx->bytes = 0;
+        *events_out = POLLOUT;
+    } else {
+        *events_out = POLLIN;
+        *connection_completed = 0;
+        // break;
     }
-
+    
     return httpRequestSize;
 }
 
-void LoadBalancer::sendHttpRequest(int serverSocket, int sizeToBeSent) {
-    int sentRequestSize = send(serverSocket, requestData, sizeToBeSent, MSG_NOSIGNAL);
+void LoadBalancer::sendHttpRequest(struct context* ctx, short* events_out, int* connection_completed) {
+    struct context* serverCtx = createServerConnection(serversAddresses[ctx->serverIndex]);
+    
+    int max_bytes = strlen(ctx->buf) - ctx->bytes;
+    
+    int sentRequestSize = send(serverCtx->fd, ctx->buf + ctx->bytes, max_bytes, MSG_NOSIGNAL);
+    
+    if (sentRequestSize < 0) return;
+
+    ctx->bytes += sentRequestSize;
+    if (sentRequestSize == max_bytes) {
+        ctx->state = ReceivingResponse;
+    } else {
+        *events_out = POLLOUT;
+        *connection_completed = 0;
+        // break;
+    }
 }
 
 int LoadBalancer::recvHttpResponse(int serverSocket) {
