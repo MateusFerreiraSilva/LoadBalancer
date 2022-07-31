@@ -20,10 +20,12 @@
 
 using namespace std;
 
+#define BUFF_SIZE 65536
 #define SERVER_FD 0
 #define FIRST_CONNECTION 1
-#define MAX_CONNECTIONS 20
+#define MAX_CONNECTIONS 100
 #define POLLFDS FIRST_CONNECTION + MAX_CONNECTIONS
+#define MAX_CONTEXTS MAX_CONNECTIONS / 2
 
 class LoadBalancer {
     private:
@@ -35,49 +37,45 @@ class LoadBalancer {
         const int secondsToTimeout = 1;
         int nextServer = 0;
 
-        // sigset_t sigset;
-        // struct signalfd_siginfo siginfo;
-        struct pollfd pollfds[MAX_CONNECTIONS + 2];
-        struct context* connections[MAX_CONNECTIONS];
-        int total_connections = 0;
+        struct pollfd pollfds[MAX_CONNECTIONS + 1];
+        vector<struct context> contexts;
+        int totalContexts = 0;
 
-        const vector< pair<string, int> > servers {
+        const vector<pair<string, int>> serversInfo {
             make_pair("127.0.0.1", 8081),
             make_pair("127.0.0.1", 8082)
         };
-
         vector<struct sockaddr_in> serversAddresses;
 
-        const int requestDataSize = 1024 * 1024 * 2; // 2 MB
-        char* requestData;
-        const int responseDataSize = 1024 * 1024 * 2; // 2 MB
-        char* responseData;
-
-        void init();
-        void startListen();
         void setNonBlocking(int socket);
         void setReuseAddr(int socket);
-        void acceptConnection();
-        void handleConnections();
-        int handleConn(struct context* ctx, short revents, short* events_out, int* connection_completed);
-        void destroyConnection(struct context* ctx);
-        struct context* createContext(int index, int socket, short* events_out);
-        void disconnectClient(int socket);
+        int getFreePoolfdIndex();
+        struct pollfd* getPoolfd(int index);
+        void init();
+        void startListen();
         void connectServers();
-        struct context* createServerConnection(struct sockaddr_in serverAddr);
+        void acceptConnections();
+        void handleConnections();
+        void processAction(struct context* ctx);
+        void destroyContext(struct context* ctx);
+        void createContext(int clientSocket);
+        // struct context* createContext(int index, int socket, short* events_out);
+        void disconnectClient(int socket);
+        void createServerConnection(struct context* ctx);
+        void addServerToContext(struct context* ctx, int serverSocket);
         void setRecvTimeout(int socket);
         int getServerIndex();
         void passRequest(int clientSocket);
-        int recvHttpRequest(struct context* ctx, short* events_out, int* connection_completed);
-        void sendHttpRequest(struct context* ctx, short* events_out, int* connection_completed);
-        int recvHttpResponse(int serverSocket);
-        void sendHttpResponse(int serverSocket, int sizeToBeSent);
-        struct context* createConnection(int socket);
+        void recvHttpRequest(struct context* ctx);
+        void sendHttpRequest(struct context* ctx);
+        void recvHttpResponse(struct context* ctx);
+        void sendHttpResponse(struct context* ctx);
+
+        void handle_error(const char* error);
 
     public:
         LoadBalancer();
         void run();
-        void handle_error(const char* error);
 };
 
 enum State {
@@ -91,15 +89,17 @@ enum State {
 
 struct context {
     public:
-        int fd;
+        int contextIndex;
         int serverIndex;
+        int clientSocket;
+        int serverSocket;
+        int clientPoolfdIndex;
+        int serverPoolfdIndex;
         State state;
-        char buf[65536];
-        size_t bytes;
-        char* buf_end;
-        bool valid;
+        char buffer[BUFF_SIZE];
+        size_t bufferUseSize; // buffer size with amount of bytes currently in use
+        char* bufferEnd;
+        bool inUse;
 };
-
-
 
 #endif
