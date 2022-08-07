@@ -7,12 +7,12 @@ LoadBalancer::LoadBalancer() {
 void LoadBalancer::setNonBlocking(int socket) {
     int flags = fcntl(socket, F_GETFD, 0); // get current flags
     if (fcntl(socket, F_SETFD, flags | O_NONBLOCK))
-        handle_error("fcntl");
+        handleError(NULL, "fcntl");
 }
 
 void LoadBalancer::setReuseAddr(int socket) {
     if (setsockopt(socket, SOL_SOCKET, SO_REUSEADDR, &REUSEADDR, sizeof(REUSEADDR)) < 0)
-        handle_error("Erro while setting master socket options");
+        handleError(NULL, "Erro while setting master socket options");
 }
 
 int LoadBalancer::getFreePoolfdIndex() {
@@ -38,7 +38,8 @@ void LoadBalancer::run() {
         for (int i = 0; i < POLLFDS; i++) pollfds[i].revents = 0;
 
         if (poll(pollfds, POLLFDS, -1) < 0) { // third arg timeout, if -1 then infinite
-            perror("poll");
+            handleError(NULL, "poll");
+            continue;
         }
 
         acceptConnections();
@@ -69,7 +70,10 @@ void LoadBalancer::init() {
 }
 
 void LoadBalancer::startListen() {
-    if ((masterSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)) < 0) handle_error("In socket");
+    if ((masterSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)) < 0) {
+        handleError(NULL, "In socket");
+        return;
+    }
 
     setNonBlocking(masterSocket);
     setReuseAddr(masterSocket);
@@ -78,8 +82,14 @@ void LoadBalancer::startListen() {
     address.sin_addr.s_addr = INADDR_ANY;
     address.sin_port = htons(port);
     
-    if (bind(masterSocket, (struct sockaddr *)&address, sizeof(address)) < 0) handle_error("In bind");
-    if (listen(masterSocket, backlog) < 0) handle_error("In listen");
+    if (bind(masterSocket, (struct sockaddr *)&address, sizeof(address)) < 0) {
+        handleError(NULL, "In bind");
+        return;
+    }
+    if (listen(masterSocket, backlog) < 0) {
+        handleError(NULL, "In listen");
+        return;
+    }
 }
 
 void LoadBalancer::connectServers() {
@@ -92,26 +102,32 @@ void LoadBalancer::connectServers() {
         serverAddr.sin_port = htons(serverPortNumber);
 
         // Convert IPv4 and IPv6 addresses from text to binary form
-        if (inet_pton(AF_INET, serverIpAddress, &serverAddr.sin_addr) <= 0)
-            handle_error("\nInvalid address/ Address not supported \n");
+        if (inet_pton(AF_INET, serverIpAddress, &serverAddr.sin_addr) <= 0) {
+            handleError(NULL, "\nInvalid address/ Address not supported \n");
+            return;
+        }
 
         serversAddresses.push_back(serverAddr);
     }
 }
 
 void LoadBalancer::acceptConnections() {
-    if (pollfds[SERVER_FD].revents & POLLERR)
-        handle_error("server failure");
+    if (pollfds[SERVER_FD].revents & POLLERR) {
+        handleError(NULL, "server failure");
+        return;
+    }
     
     if (pollfds[SERVER_FD].revents & POLLIN) { // check if have activity on the laodbalancer listener
         struct sockaddr_in clientAddress;
         int clientAddrlen = sizeof(clientAddress);
         int clientSocket = accept(masterSocket, (struct sockaddr *)&clientAddress, (socklen_t *)&clientAddrlen);
         // printf("\nNew connection , socket fd is %d , ip is : %s , port : %d \n", socket, inet_ntoa(clientAddress.sin_addr), ntohs(clientAddress.sin_port));
-        if (clientSocket < 0) handle_error("Error acception connection");
+        if (clientSocket < 0) {
+            handleError(NULL, "Error acception connection");
+            return;
+        }
 
         setNonBlocking(clientSocket);
-
         createContext(clientSocket);
     }
 }
@@ -127,6 +143,8 @@ void LoadBalancer::createContext(int clientSocket) {
             contexts[i].serverIndex = -1; // no server set
             contexts[i].clientSocket = clientSocket;
             contexts[i].serverSocket = -1; // no server set
+            contexts[i].haveConnectionWithServer = false;
+            contexts[i].tries = 0;
             contexts[i].state = ReceivingRequest;
             contexts[i].bufferUseSize = 0;
             contexts[i].bufferEnd = NULL;
@@ -148,7 +166,8 @@ void LoadBalancer::handleConnections() {
     for (int i = 0; i < MAX_CONTEXTS; i++) {
         struct context* ctx = &contexts[i];
         // check if the context is not in use then skip it
-        if (ctx->inUse == false) continue;
+        if (ctx->inUse == false)
+            continue;
 
         const int fdsSize = 2;
         struct pollfd* fds[fdsSize];
@@ -156,10 +175,14 @@ void LoadBalancer::handleConnections() {
         fds[1] = getPoolfd(ctx->serverPoolfdIndex);
 
         for (int j = 0; j < fdsSize; j++) {
-            if (fds[j] == NULL) continue; // if not valid fd, go to next
+            if (fds[j] == NULL)
+                continue; // if not valid fd, go to next
 
             int revents = fds[j]->revents;
-            if (revents & POLLERR) handle_error("socket failure");
+            if (revents & POLLERR) {
+                handleError(ctx, "socket failure");
+                return;
+            }
             
             if (revents) {
                 processAction(ctx);
@@ -170,6 +193,9 @@ void LoadBalancer::handleConnections() {
 
 void LoadBalancer::processAction(struct context* ctx) {
     switch (ctx->state) {
+        case Error:
+            sendErrorResponse(ctx);
+            break;
         case ReceivingRequest:
             recvHttpRequest(ctx);
             break;
@@ -211,29 +237,38 @@ void LoadBalancer::destroyContext(struct context* ctx) {
 
 void LoadBalancer::createServerConnection(struct context* ctx) {
     struct sockaddr_in serverAddr = serversAddresses[ctx->serverIndex]; // TO DO function to access it
+    if (ctx->serverSocket < 0)
+        createServerSocket(ctx);
+
+    const int connection = connect(ctx->serverSocket, (struct sockaddr*)&serverAddr, sizeof(serverAddr));
+    if (connection == EINPROGRESS || connection == EALREADY)
+        return;
+    else if (connection < 0) {
+        handleError(ctx, "Connection Failed");
+        return;
+    }
+
+    addServerToContext(ctx);
+}
+
+void LoadBalancer::createServerSocket(struct context* ctx) {
+    struct sockaddr_in serverAddr = serversAddresses[ctx->serverIndex]; // TO DO function to access it
     int serverSocket;
     if ((serverSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)) < 0) {
-        perror("In socket");
-        exit(EXIT_FAILURE);
+        handleError(ctx, "creating server socket");
     }
     
     setRecvTimeout(serverSocket);
-
-    if ((connect(serverSocket, (struct sockaddr*)&serverAddr, sizeof(serverAddr))) < 0)
-        handle_error("Connection Failed");
-
-    // TO DO see how to configure a connect to be async
-
     setNonBlocking(serverSocket);
-    addServerToContext(ctx, serverSocket);
+    ctx->serverSocket = serverSocket;
 }
 
-void LoadBalancer::addServerToContext(struct context* ctx, int serverSocket) {
+void LoadBalancer::addServerToContext(struct context* ctx) {
     int serverPoolfdIndex = getFreePoolfdIndex();
-    ctx->serverSocket = serverSocket;
     ctx->serverPoolfdIndex = serverPoolfdIndex;
-    pollfds[serverPoolfdIndex].fd = serverSocket;
+    pollfds[serverPoolfdIndex].fd = ctx->serverSocket;
     pollfds[serverPoolfdIndex].events = POLLOUT;
+    ctx->haveConnectionWithServer = true;
 }
 
 void LoadBalancer::setRecvTimeout(int socket) {
@@ -255,7 +290,10 @@ void LoadBalancer::recvHttpRequest(struct context* ctx) {
     int max_bytes = sizeof(ctx->buffer);
     int httpRequestSize = recv(ctx->clientSocket, ctx->buffer, max_bytes, 0);
     
-    if (httpRequestSize < 0) return;
+    if (httpRequestSize < 0) {
+        handleError(ctx, "error receiving request");
+        return;
+    };
 
     struct pollfd* clientfd = getPoolfd(ctx->clientPoolfdIndex);
     ctx->bufferUseSize = httpRequestSize;
@@ -271,13 +309,20 @@ void LoadBalancer::recvHttpRequest(struct context* ctx) {
 }
 
 void LoadBalancer::sendHttpRequest(struct context* ctx) {
-    createServerConnection(ctx);
+    if (!ctx->haveConnectionWithServer) {
+        createServerConnection(ctx);
+        if (!ctx->haveConnectionWithServer)
+            return;
+    }
     
     int max_bytes = ctx->bufferUseSize;
     
     int sentRequestSize = send(ctx->serverSocket, ctx->buffer, max_bytes, MSG_NOSIGNAL);
     
-    if (sentRequestSize < 0) return;
+    if (sentRequestSize < 0) {
+        handleError(ctx, "error sending request");
+        return;
+    }
 
     struct pollfd* serverfd = getPoolfd(ctx->serverPoolfdIndex);
 
@@ -286,7 +331,7 @@ void LoadBalancer::sendHttpRequest(struct context* ctx) {
         ctx->state = ReceivingResponse;
         serverfd->events = POLLIN;
     } else {
-        serverfd->events = POLLOUT;
+        serverfd->events = POLLOUT; // sus
     }
 }
 
@@ -294,7 +339,10 @@ void LoadBalancer::recvHttpResponse(struct context* ctx) {
     int max_bytes = ctx->bufferUseSize;
     int httpRequestSize = recv(ctx->serverSocket, ctx->buffer, max_bytes, 0);
     
-    if (httpRequestSize < 0) return;
+    if (httpRequestSize < 0) {
+        handleError(ctx, "error receiving response");
+        return;
+    }
 
     struct pollfd* serverfd = getPoolfd(ctx->serverPoolfdIndex);
     ctx->bufferUseSize = httpRequestSize;
@@ -312,7 +360,10 @@ void LoadBalancer::sendHttpResponse(struct context* ctx) {
     
     int sentRequestSize = send(ctx->clientSocket, ctx->buffer, max_bytes, MSG_NOSIGNAL);
     
-    if (sentRequestSize < 0) return;
+    if (sentRequestSize < 0) {
+        handleError(ctx, "error sending response");
+        return;
+    }
 
     struct pollfd* clientfd = getPoolfd(ctx->clientSocket);
 
@@ -324,10 +375,46 @@ void LoadBalancer::sendHttpResponse(struct context* ctx) {
     }
 }
 
-/*
- * Temp
-*/
-void LoadBalancer::handle_error(const char* error) {
-    perror(error);
-    exit(1);
+void LoadBalancer::sendErrorResponse(struct context* ctx) {
+    sendErrorMessage(ctx);
+    ctx->state = Done;
+}
+
+void LoadBalancer::sendErrorMessage(struct context* ctx) {
+    const string errorMessage = "HTTP/1.1 500 Internal Server Error\nContent-Type: text/plain\nContent-Length: 13\n\n500 Internal Server Error";
+    const int errorMessageSize = (int) errorMessage.size();
+
+    if (ctx->clientSocket < 0) {
+        ctx->state = Done;
+        return;
+    }
+
+    int sentRequestSize = send(ctx->clientSocket, errorMessage.c_str(), errorMessageSize, MSG_NOSIGNAL);
+    
+    if (sentRequestSize < 0) {
+        ctx->state = Done;
+    } else if (sentRequestSize == errorMessageSize) {
+        ctx->state = Done;
+    }
+}
+
+void LoadBalancer::handleError(struct context* ctx, const char* error) {
+    if (debugMode)
+        perror(error);
+
+    if (ctx != NULL) {
+        if (ctx->state == SendingRequest) {
+            if (ctx->tries < maxTries) {
+                ctx->serverIndex = getServerIndex(); // get new server in case of error
+                ctx->haveConnectionWithServer = false;
+                close(ctx->serverSocket);
+                ctx->serverSocket = -1;
+                ctx->tries++;
+                return;
+            }
+        }
+
+        sendErrorMessage(ctx);
+        ctx->state = Error;
+    }
 }

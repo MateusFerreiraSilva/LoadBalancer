@@ -23,7 +23,7 @@ using namespace std;
 #define BUFF_SIZE 65536
 #define SERVER_FD 0
 #define FIRST_CONNECTION 1
-#define MAX_CONNECTIONS 100
+#define MAX_CONNECTIONS 10000 * 2
 #define POLLFDS FIRST_CONNECTION + MAX_CONNECTIONS
 #define MAX_CONTEXTS MAX_CONNECTIONS / 2
 
@@ -36,6 +36,8 @@ class LoadBalancer {
         const int REUSEADDR = 1;
         const int secondsToTimeout = 1;
         int nextServer = 0;
+        bool debugMode = true;
+        const int maxTries = 3;
 
         struct pollfd pollfds[MAX_CONNECTIONS + 1];
         vector<struct context> contexts;
@@ -47,6 +49,7 @@ class LoadBalancer {
         };
         vector<struct sockaddr_in> serversAddresses;
 
+        void handleError(struct context* ctx, const char* error);
         void setNonBlocking(int socket);
         void setReuseAddr(int socket);
         int getFreePoolfdIndex();
@@ -62,7 +65,8 @@ class LoadBalancer {
         // struct context* createContext(int index, int socket, short* events_out);
         void disconnectClient(int socket);
         void createServerConnection(struct context* ctx);
-        void addServerToContext(struct context* ctx, int serverSocket);
+        void createServerSocket(struct context* ctx);
+        void addServerToContext(struct context* ctx);
         void setRecvTimeout(int socket);
         int getServerIndex();
         void passRequest(int clientSocket);
@@ -70,8 +74,8 @@ class LoadBalancer {
         void sendHttpRequest(struct context* ctx);
         void recvHttpResponse(struct context* ctx);
         void sendHttpResponse(struct context* ctx);
-
-        void handle_error(const char* error);
+        void sendErrorResponse(struct context* ctx);
+        void sendErrorMessage(struct context* ctx);
 
     public:
         LoadBalancer();
@@ -79,12 +83,12 @@ class LoadBalancer {
 };
 
 enum State {
-    Idle,
     ReceivingRequest,
     SendingRequest,
     ReceivingResponse,
     SendingResponse,
-    Done
+    Done,
+    Error
 };
 
 struct context {
@@ -95,6 +99,8 @@ struct context {
         int serverSocket;
         int clientPoolfdIndex;
         int serverPoolfdIndex;
+        bool haveConnectionWithServer;
+        int tries;
         State state;
         char buffer[BUFF_SIZE];
         size_t bufferUseSize; // buffer size with amount of bytes currently in use
