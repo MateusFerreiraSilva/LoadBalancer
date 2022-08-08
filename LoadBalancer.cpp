@@ -53,11 +53,11 @@ void LoadBalancer::readConfigFile() {
     if (file.is_open()) {
 
         while (file >> word) {
-            if (word == "routing-method") {
+            if (word == "routing-method:") {
                 string method;
                 file >> method;
                 routingMethod = method == "LeastConnected" ? LeastConnected : RoundRobin;
-            } else if (word == "servers") {
+            } else if (word == "servers:") {
                 int n, portNumber;
                 string addr;
 
@@ -66,7 +66,7 @@ void LoadBalancer::readConfigFile() {
                     file >> addr >> portNumber;
                     serversInfo.push_back(make_pair(addr, portNumber));
                 }
-            } else if (word == "debugMode") {
+            } else if (word == "debugMode:") {
                 bool isDebugMode;
                 file >> isDebugMode;
                 debugMode = isDebugMode;
