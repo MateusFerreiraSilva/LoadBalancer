@@ -1,0 +1,16 @@
+In order to build the program your can run the command:
+    make LoadBalancer
+
+When you run this program it will read a file in the same directory named "config", make sure you have it before you run this program (This project already come with a default config file).
+
+The configuration file is organized as follows:
+
+routing-method: (RoundRobin or LeastConnected)
+servers: N (Number of servers)
+(N Servers IP address and port number separated by space)
+debugMode: (Boolean value indicatin if the debug is enabled)
+
+After this your can run it typing:
+    ./LoadBalancer
+
+If you want to test the LoadBalancer, you can run the test serve that comes with this project by typing: "node server.js", and after this you will need to input the port where this server will run, and of course you will need node installed on your machine.

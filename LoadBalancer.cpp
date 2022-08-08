@@ -47,7 +47,38 @@ void LoadBalancer::run() {
     }
 }
 
+void LoadBalancer::readConfigFile() {
+    ifstream file(configFile);
+    string word;
+    if (file.is_open()) {
+
+        while (file >> word) {
+            if (word == "routing-method") {
+                string method;
+                file >> method;
+                routingMethod = method == "LeastConnected" ? LeastConnected : RoundRobin;
+            } else if (word == "servers") {
+                int n, portNumber;
+                string addr;
+
+                file >> n;
+                for (int i = 0; i < n; i++) {
+                    file >> addr >> portNumber;
+                    serversInfo.push_back(make_pair(addr, portNumber));
+                }
+            } else if (word == "debugMode") {
+                bool isDebugMode;
+                file >> isDebugMode;
+                debugMode = isDebugMode;
+            }
+        }
+
+        file.close();
+    }
+}
+
 void LoadBalancer::init() {
+    readConfigFile();
     startListen();
 
     // put master socket in pollFds
@@ -108,6 +139,8 @@ void LoadBalancer::connectServers() {
         }
 
         serversAddresses.push_back(serverAddr);
+        serversErros.push_back(0);
+        serversTotalConnections.push_back(0);
     }
 }
 
@@ -220,6 +253,9 @@ void LoadBalancer::destroyContext(struct context* ctx) {
     close(c->clientSocket);
     close(c->serverSocket);
 
+    if (ctx->serverIndex != -1)
+        serversTotalConnections[ctx->serverIndex]--;
+
     int clientPoolfdIndex = c->clientPoolfdIndex;
     if (clientPoolfdIndex >= 0) {
         pollfds[clientPoolfdIndex].fd = -1;
@@ -236,6 +272,11 @@ void LoadBalancer::destroyContext(struct context* ctx) {
 }
 
 void LoadBalancer::createServerConnection(struct context* ctx) {
+    if (ctx->serverIndex == -1) {
+        handleError(ctx, "Server index");
+        return;
+    }
+
     struct sockaddr_in serverAddr = serversAddresses[ctx->serverIndex]; // TO DO function to access it
     if (ctx->serverSocket < 0)
         createServerSocket(ctx);
@@ -249,9 +290,17 @@ void LoadBalancer::createServerConnection(struct context* ctx) {
     }
 
     addServerToContext(ctx);
+
+    if (ctx->serverIndex != -1)
+        serversTotalConnections[ctx->serverIndex]++;
 }
 
 void LoadBalancer::createServerSocket(struct context* ctx) {
+    if (ctx->serverIndex == -1) {
+        handleError(ctx, "Create server socket, getting index");
+        return;
+    }
+    
     struct sockaddr_in serverAddr = serversAddresses[ctx->serverIndex]; // TO DO function to access it
     int serverSocket;
     if ((serverSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)) < 0) {
@@ -279,10 +328,45 @@ void LoadBalancer::setRecvTimeout(int socket) {
 }
 
 int LoadBalancer::getServerIndex() {
-    // round robin
+    switch (routingMethod) {
+        case LeastConnected:
+            return leastConnected();
+        default:
+            return roundRobin();
+    }
+}
+
+int LoadBalancer::roundRobin() {
     int serverIdx = nextServer;
-    nextServer = (nextServer + 1) % (int) serversAddresses.size();
+    const int numOfServers = (int) serversAddresses.size();
+
+    for(int i = 0; i < numOfServers; i++) {
+        nextServer = (nextServer + 1) % numOfServers;
+        if (serversInfo[nextServer].first != "error")
+            break;
+        else if (i == numOfServers - 1)
+            return -1;
+    }
     
+    return serverIdx;
+}
+
+int LoadBalancer::leastConnected() {
+    vector<int> serversIdxList;
+    for (int idx = 0; idx < serversInfo.size(); idx++) {
+        if (serversInfo[idx].first != "error")
+            serversIdxList.push_back(idx);
+    }
+
+    int serverIdx = -1;
+    int minConnections = INT32_MAX;
+    for (int i = 0; i < serversIdxList.size(); i++) {
+        if (minConnections > serversTotalConnections[serversIdxList[i]]) {
+            serverIdx = serversIdxList[i];
+            minConnections = serversTotalConnections[serversIdxList[i]];
+        }
+    }
+
     return serverIdx;
 }
 
@@ -303,8 +387,6 @@ void LoadBalancer::recvHttpRequest(struct context* ctx) {
         ctx->state = SendingRequest; // change state
         ctx->serverIndex = getServerIndex();
         clientfd->events = POLLOUT;
-    } else {
-        clientfd->events = POLLIN;
     }
 }
 
@@ -316,7 +398,6 @@ void LoadBalancer::sendHttpRequest(struct context* ctx) {
     }
     
     int max_bytes = ctx->bufferUseSize;
-    
     int sentRequestSize = send(ctx->serverSocket, ctx->buffer, max_bytes, MSG_NOSIGNAL);
     
     if (sentRequestSize < 0) {
@@ -325,13 +406,11 @@ void LoadBalancer::sendHttpRequest(struct context* ctx) {
     }
 
     struct pollfd* serverfd = getPoolfd(ctx->serverPoolfdIndex);
-
     ctx->bufferUseSize = sentRequestSize;
+
     if (sentRequestSize == max_bytes) {
         ctx->state = ReceivingResponse;
         serverfd->events = POLLIN;
-    } else {
-        serverfd->events = POLLOUT; // sus
     }
 }
 
@@ -350,8 +429,6 @@ void LoadBalancer::recvHttpResponse(struct context* ctx) {
     ctx->bufferEnd = (char*) memchr(ctx->buffer, '\n', ctx->bufferUseSize);
     if (ctx->bufferEnd) {
         ctx->state = SendingResponse; // change state
-    } else {
-        serverfd->events = POLLIN;
     }
 }
 
@@ -366,12 +443,10 @@ void LoadBalancer::sendHttpResponse(struct context* ctx) {
     }
 
     struct pollfd* clientfd = getPoolfd(ctx->clientSocket);
-
     ctx->bufferUseSize = sentRequestSize;
+
     if (sentRequestSize == max_bytes) {
         ctx->state = Done; // change state
-    } else {
-        clientfd->events = POLLOUT;
     }
 }
 
@@ -381,7 +456,7 @@ void LoadBalancer::sendErrorResponse(struct context* ctx) {
 }
 
 void LoadBalancer::sendErrorMessage(struct context* ctx) {
-    const string errorMessage = "HTTP/1.1 500 Internal Server Error\nContent-Type: text/plain\nContent-Length: 13\n\n500 Internal Server Error";
+    const string errorMessage = "HTTP/1.1 500 Internal Server Error\nContent-Type: text/plain\nContent-Length: 25\n\n500 Internal Server Error";
     const int errorMessageSize = (int) errorMessage.size();
 
     if (ctx->clientSocket < 0) {
@@ -398,6 +473,15 @@ void LoadBalancer::sendErrorMessage(struct context* ctx) {
     }
 }
 
+void LoadBalancer::removeServer(struct context* ctx) {
+    if (ctx->serverIndex != -1) {
+        serversErros[ctx->serverIndex]++;
+        if (serversErros[ctx->serverIndex] == maxServerTries) {
+            serversInfo[ctx->serverIndex].first = "error"; 
+        }
+    }
+}
+
 void LoadBalancer::handleError(struct context* ctx, const char* error) {
     if (debugMode)
         perror(error);
@@ -405,7 +489,12 @@ void LoadBalancer::handleError(struct context* ctx, const char* error) {
     if (ctx != NULL) {
         if (ctx->state == SendingRequest) {
             if (ctx->tries < maxTries) {
+                removeServer(ctx);
+
+                if (ctx->serverIndex != -1)
+                    serversTotalConnections[ctx->serverIndex]--;
                 ctx->serverIndex = getServerIndex(); // get new server in case of error
+                
                 ctx->haveConnectionWithServer = false;
                 close(ctx->serverSocket);
                 ctx->serverSocket = -1;
